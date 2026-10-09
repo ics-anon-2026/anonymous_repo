@@ -5,8 +5,8 @@ from pathlib import Path
 from collections import defaultdict
 import numpy as np
 
-RES = Path((Path(__file__).resolve().parents[3] / "results" / "direction2"))
-OUT_DIR = Path((Path(__file__).resolve().parents[3] / "papers" / "direction2"))
+RES = Path(r"D:\workbuddy工作区\SCI论文发表\results\direction2")
+OUT_DIR = Path(r"D:\workbuddy工作区\SCI论文发表\papers\direction2")
 
 SEED_FILES = [RES / "lambda_beta_sensitivity_Amazon.csv"] + \
              [RES / f"lambda_beta_sensitivity_Amazon_s{s}.csv" for s in [1, 2, 3, 4]]

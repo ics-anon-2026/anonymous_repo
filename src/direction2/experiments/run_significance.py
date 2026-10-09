@@ -5,7 +5,7 @@ from pathlib import Path
 from scipy import stats
 import numpy as np
 
-RES = Path((Path(__file__).resolve().parents[3] / "results" / "direction2"))
+RES = Path(r"D:\workbuddy工作区\SCI论文发表\results\direction2")
 
 
 def read_aucs(pattern):

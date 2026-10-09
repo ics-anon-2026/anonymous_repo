@@ -160,6 +160,10 @@ def main(argv=None):
                         help="use domain-based OOD split instead of random split")
     parser.add_argument("--ood_domains", type=int, default=3,
                         help="number of domains for OOD split")
+    parser.add_argument("--ood_seed", type=int, default=42,
+                        help="K-means seed for OOD domain split; FIXED across training seeds "
+                             "so the split is a dataset property, independent of the training "
+                             "seed and of the ICS environment partition (M=3, random_state=42)")
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -174,8 +178,8 @@ def main(argv=None):
     data = ds[0]
 
     if args.ood_split:
-        print(f"Using OOD domain split (n_domains={args.ood_domains})")
-        data, _ = domain_split(data, n_domains=args.ood_domains, seed=args.seed)
+        print(f"Using OOD domain split (n_domains={args.ood_domains}, seed={args.ood_seed})")
+        data, _ = domain_split(data, n_domains=args.ood_domains, seed=args.ood_seed)
 
     print(f"\n=== {args.dataset} | {args.model} | method={args.method} | topk={args.topk} ===")
     fraud_ratio = (data.y == 1).float().mean().item()

@@ -5,7 +5,7 @@ import glob
 import numpy as np
 from collections import defaultdict
 
-results_dir = (Path(__file__).resolve().parents[3] / "results" / "direction2")
+results_dir = r"D:\workbuddy工作区\SCI论文发表\results\direction2"
 
 rows = []
 for f in glob.glob(os.path.join(results_dir, "*.csv")):

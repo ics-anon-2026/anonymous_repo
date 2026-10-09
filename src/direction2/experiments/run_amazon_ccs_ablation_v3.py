@@ -4,7 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PY = sys.executable
+PY = "d:/Miniconda3/python.exe"
 RUN = "src/direction2/experiments/run_ccs.py"
 COMMON = [
     "--dataset", "Amazon", "--model", "BinaryGAT", "--topk", "20",

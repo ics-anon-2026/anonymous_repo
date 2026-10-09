@@ -25,10 +25,12 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch_geometric.utils import subgraph
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "data"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "models"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "utils"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src" / "common" / "attacks"))
 
 from ccs import CausalCollaborativeSparsification
 from fraud_dataset import FraudDataset
@@ -37,6 +39,54 @@ from gnn import BinaryGAT, GCN
 from train_eval import train_epoch, evaluate_with_val_threshold
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def sample_subset(data, n=2000, seed=0):
+    """抽取 n 节点的平衡子图（约 40% 欺诈 + 60% 良性），1-hop 扩张后保留连通边。
+    用 PyG subgraph 重标号。用于小规模验证，证明攻击管线可在真实数据上跑通。
+    """
+    g = torch.Generator().manual_seed(seed)
+    y = data.y
+    fraud = (y == 1).nonzero(as_tuple=True)[0]
+    benign = (y == 0).nonzero(as_tuple=True)[0]
+    nf = int(min(len(fraud), 0.4 * n))
+    nb = int(min(len(benign), 0.6 * n))
+    if nf == 0:
+        nf = int(n * 0.4); nb = n - nf
+    seeds = torch.cat([
+        fraud[torch.randperm(len(fraud), generator=g)[:nf]],
+        benign[torch.randperm(len(benign), generator=g)[:nb]],
+    ]).tolist()
+    selected = set(seeds)
+    a, b = data.edge_index
+    adj = {}
+    for i in range(data.edge_index.size(1)):
+        u, v = int(a[i]), int(b[i])
+        adj.setdefault(u, []).append(v)
+    frontier = list(selected)
+    while len(selected) < n and frontier:
+        nxt = []
+        for u in frontier:
+            for v in adj.get(u, []):
+                if v not in selected:
+                    selected.add(v)
+                    nxt.append(v)
+                    if len(selected) >= n:
+                        break
+            if len(selected) >= n:
+                break
+        frontier = nxt
+    subset = torch.tensor(sorted(selected), dtype=torch.long)
+    sub_ei, _ = subgraph(subset, data.edge_index, relabel_nodes=True)
+    new_data = data.clone()
+    new_data.x = data.x[subset]
+    new_data.y = data.y[subset]
+    new_data.edge_index = sub_ei
+    for attr in ("train_mask", "val_mask", "test_mask"):
+        if hasattr(data, attr):
+            setattr(new_data, attr, getattr(data, attr)[subset])
+    new_data.num_nodes = len(subset)
+    return new_data
 
 
 def random_sparsify(edge_index, num_nodes, k, seed=42):
@@ -302,7 +352,7 @@ def roc_auc_safe(y_true, y_prob):
 
 
 def run_one(dataset_name, attack_name, defense, seed, budget=0.05, topk=20,
-            n_envs=3, device="cpu"):
+            n_envs=3, device="cpu", subset=0):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -315,14 +365,26 @@ def run_one(dataset_name, attack_name, defense, seed, budget=0.05, topk=20,
                           use_hetero=use_hetero)
         topk_ds = topk
     data = ds[0]
-    print(f"\n=== {dataset_name} | attack={attack_name} | defense={defense} | seed={seed} ===")
+
+    # 小规模验证：先抽取子集（保持预算/训练可行）
+    if subset and subset > 0:
+        data = sample_subset(data, n=subset, seed=seed)
+
+    print(f"\n=== {dataset_name} | attack={attack_name} | defense={defense} | seed={seed} "
+          f"{('| subset='+str(subset)) if subset else ''} ===")
     print(f"Original edges={data.num_edges//2}")
 
     t0 = time.time()
-    if attack_name == "dice":
-        data.edge_index = dice_attack(data, budget=budget, seed=seed)
-    elif attack_name == "nettack":
-        data.edge_index = nettack_attack(data, budget=budget, seed=seed, device=device)
+    if attack_name in ("dice", "nettack"):
+        if attack_name == "dice":
+            data.edge_index = dice_attack(data, budget=budget, seed=seed)
+        else:
+            data.edge_index = nettack_attack(data, budget=budget, seed=seed, device=device)
+    elif attack_name in ("camo", "prbcd", "metattack", "binarized"):
+        # 统一攻击分发：调用 src/common/attacks/connect.py
+        from connect import attack_to_edge_index
+        data.edge_index, attack_info = attack_to_edge_index(
+            data, attack_name, budget=budget, seed=seed, device=device)
     else:
         raise ValueError(attack_name)
     t_attack = time.time() - t0
@@ -340,6 +402,15 @@ def run_one(dataset_name, attack_name, defense, seed, budget=0.05, topk=20,
         edge_index_dict = data.edge_index_dict if hasattr(data, "edge_index_dict") else None
         data, _ = ccs.fit_transform(data, edge_index_dict=edge_index_dict)
         data = data.to("cpu")
+    elif defense in ("kces", "graphconsis"):
+        from kces import kces_sanitize, graphconsis_sanitize
+        if defense == "kces":
+            data.edge_index = kces_sanitize(data.edge_index, data.x,
+                                            data.num_nodes, topk_ds)
+        else:
+            data.edge_index = graphconsis_sanitize(data.edge_index, data.x,
+                                                   data.num_nodes, topk_ds)
+        data.edge_index = data.edge_index.contiguous()
     t_def = time.time() - t0
     print(f"After defense edges={data.num_edges//2} (defense {t_def:.1f}s)")
 
@@ -355,7 +426,9 @@ def run_one(dataset_name, attack_name, defense, seed, budget=0.05, topk=20,
 
     out_dir = ROOT / "results" / "direction2"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / f"{dataset_name}_BinaryGAT_{defense}_attack-{attack_name}_s{seed}.csv"
+    # subset 验证运行的产物加 _sub{N} 后缀，避免与全量结果同名覆盖
+    sub_tag = f"_sub{subset}" if subset and subset > 0 else ""
+    out_file = out_dir / f"{dataset_name}_BinaryGAT_{defense}_attack-{attack_name}{sub_tag}_s{seed}.csv"
     with open(out_file, "w") as f:
         f.write("dataset,model,defense,attack,topk,n_envs,seed,budget,"
                 "test_acc,test_f1,test_auc,attack_time,defense_time,train_time\n")
@@ -367,26 +440,37 @@ def run_one(dataset_name, attack_name, defense, seed, budget=0.05, topk=20,
 
 
 def main():
+    # 资源硬上限：CPU/内存占用不超过 70%（线程+亲和性+Windows Job Object 内存上限）
+    try:
+        from resource_limiter import apply_limits
+        apply_limits(cpu_frac=0.70, mem_frac=0.70)
+    except Exception as e:
+        print(f"[warn] resource_limiter 未生效: {e}")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="Amazon")
-    parser.add_argument("--attack", default="dice", choices=["dice", "nettack"])
-    parser.add_argument("--defense", default="ics", choices=["random", "ics"])
+    parser.add_argument("--attack", default="dice",
+                        choices=["dice", "nettack", "camo", "prbcd", "metattack", "binarized"])
+    parser.add_argument("--defense", default="ics",
+                        choices=["random", "ics", "kces", "graphconsis"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--budget", type=float, default=0.05)
+    parser.add_argument("--subset", type=int, default=0,
+                        help="抽取 N 节点平衡子图（小规模验证用，0=全量）")
     parser.add_argument("--all", action="store_true",
                         help="Run full matrix: 2 datasets x 2 attacks x 2 defenses x 3 seeds")
     args = parser.parse_args()
 
     if args.all:
         for ds_name in ["Amazon", "YelpChi"]:
-            for attack_name in ["dice", "nettack"]:
-                for defense in ["random", "ics"]:
+            for attack_name in ["dice", "nettack", "camo", "prbcd"]:
+                for defense in ["random", "ics", "kces", "graphconsis"]:
                     for seed in [0, 1, 2]:
                         run_one(ds_name, attack_name, defense, seed,
-                                budget=args.budget)
+                                budget=args.budget, subset=args.subset)
     else:
         run_one(args.dataset, args.attack, args.defense, args.seed,
-                budget=args.budget)
+                budget=args.budget, subset=args.subset)
 
 
 if __name__ == "__main__":

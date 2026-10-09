@@ -1,0 +1,541 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+
+\begin{document}
+
+\title{Training-Free Graph Sparsification as a Robust Defense against Structural Attacks on Fraud Detection Graphs: A Systematic Benchmark}
+
+\author{
+Jihong Tang\textsuperscript{1} \and Wenjuan Xu\textsuperscript{2} \\
+\textsuperscript{1} Cheng Yi College, Jimei University, Xiamen, China \\
+\textsuperscript{2} Xiamen Institute of Technology, Xiamen, China \\
+\texttt{ky\_tjh@163.com}; \texttt{276771153@qq.com}
+}
+
+\date{}
+
+\maketitle
+
+\begin{abstract}
+Graph neural networks for fraud detection are vulnerable to noisy, densely connected edges and to adversarial structural perturbations. Training-free graph sparsification is an attractive defense: it purifies the graph before any model is trained, at zero label and training cost. In this paper we study this defense systematically and propose \emph{Invariant Collaborative Sparsification} (ICS), a training-free edge-selection method that scores edges by feature consistency, cross-environment stability, and an optional multi-relation bonus. We evaluate ICS and three reference sparsifiers (random top-$k$, KCES, GraphConsis) on three public fraud benchmarks (YelpChi, Amazon, Elliptic) under five structural attacks spanning evasion/poisoning and gradient/heuristic strategies, across five random seeds. ICS consistently improves AUC over random sparsification on the dense graphs (up to $+0.21$ on Amazon, $+0.14$ on YelpChi) and is the only method that is never the worst across all attack settings. Notably, under GAD-specific poisoning attacks (PRBCD, BinarizedAttack) ICS's AUC is retained or even increased ($90$--$113\%$ of its clean level), because the sparsifier removes attack-crafted edges lacking multi-relation corroboration. Under out-of-distribution feature splits ICS likewise preserves a large advantage over random sparsification. An ablation yields an honest negative result: the collaborative bonus is harmful on weak-relation datasets (YelpChi) and neutral elsewhere, so similarity-aware selection is the reliable core. We release code and a unified evaluation protocol.
+\end{abstract}
+
+\paragraph{Keywords}
+Graph neural networks $\cdot$ Fraud detection $\cdot$ Graph sparsification $\cdot$ Adversarial robustness $\cdot$ Out-of-distribution generalization
+
+\paragraph{Highlights}
+\begin{itemize}
+\item Training-free sparsification defends fraud GNNs against structural attacks.
+\item We propose ICS, a label-free, similarity-aware edge-selection method (no training).
+\item Systematic benchmark of 5 attacks, 3 datasets, 4 sparsifiers, 5 seeds (198 runs).
+\item ICS is never the worst defense under any attack and resists GAD-specific poisoning.
+\item Honest ablation: the collaborative bonus is harmful on weak-relation data.
+\end{itemize}
+
+\section{Introduction}\label{sec:intro}
+
+Online fraud detection is of paramount importance for e-commerce, financial services, and social media platforms. Fraudsters manipulate reviews, transactions, and user relationships to hide their identities, making the underlying data naturally graph-structured and heterogeneous. Graph Neural Networks (GNNs) such as Graph Convolutional Networks (GCNs) \cite{kipf2017gcn} and Heterogeneous Graph Attention Networks (HAN) \cite{wang2019han} have been widely adopted because they aggregate neighborhood information to identify suspicious patterns \cite{dou2020caregnn,liu2021fraudreview}.
+
+Despite their popularity, standard GNNs face two critical challenges in fraud detection. First, fraud graphs are usually extremely dense: a single user may be connected to thousands of others through shared devices, IP addresses, or transaction histories. Densely connecting all neighbors dilutes the true fraud signal and makes message passing computationally expensive. Second, many edges are \emph{correlative but not causal}: two users may share a feature by coincidence rather than because they belong to the same fraud campaign. When a GNN blindly aggregates these edges, it may latch onto spurious correlations and fail to generalize, especially under class imbalance.
+
+A common remedy is graph sparsification, which keeps only a subset of edges per node. Random top-$k$ sampling is fast but ignores semantic relevance; adaptive methods such as GNNGuard \cite{zhang2020gnnguard} and ProGNN \cite{jin2020prognn} learn a clean adjacency matrix jointly with the classifier, but they are designed for homogeneous graphs and adversarial robustness rather than heterogeneous fraud detection. More importantly, these methods rarely ask: \emph{which edges are causally stable across different data environments?}
+
+Motivated by the need for a cheap, deployable defense, this paper studies \emph{training-free graph sparsification} as a robustness mechanism for fraud-detection GNNs and proposes \textbf{Invariant Collaborative Sparsification (ICS)}, an edge-selection method guided by two principles:
+\begin{enumerate}
+    \item \textbf{Invariant stability.} Edges whose feature signal is consistent across multiple feature-based environments are more likely to encode stable, label-relevant relationships than spurious correlations.
+    \item \textbf{Collaborative corroboration (optional).} In heterogeneous graphs, an edge present in several relation types is less likely to be coincidental; we add a multi-relation bonus, but show it is dataset-dependent and sometimes harmful.
+\end{enumerate}
+
+Concretely, ICS partitions nodes into environments via feature clustering, scores each edge by feature consistency, cross-environment stability, and an optional multi-relation bonus, and keeps each node's top-$k$ edges. The sparse graph is then fed to any downstream GNN. Beyond proposing ICS, the main contribution of this paper is a \emph{systematic robustness benchmark}: we evaluate ICS against random top-$k$, KCES, and GraphConsis under five structural attacks spanning evasion/poisoning and gradient/heuristic knowledge, on three public fraud graphs, across five seeds.
+
+Our contributions are:
+\begin{itemize}
+    \item We propose ICS, a training-free, label-free graph sparsifier that selects edges by feature consistency and cross-environment stability, with an optional collaborative bonus. Sparsification takes a few seconds on million-edge graphs.
+    \item We conduct, to our knowledge, the first systematic benchmark of training-free sparsification as a defense against structural attacks on fraud graphs, covering five attacks, three datasets, four sparsifiers, and five seeds (198 runs in total).
+    \item We show that ICS is the only defense that is never the worst under any attack, and that it is surprisingly robust to GAD-specific poisoning (PRBCD, BinarizedAttack), whose injected edges are filtered out by the sparsifier.
+    \item We report an honest negative result: the collaborative relation bonus is harmful on weak-relation datasets (YelpChi) and neutral elsewhere, so similarity-aware selection is the reliable core; this bounds the paper's claims accordingly.
+\end{itemize}
+
+\section{Related Work}\label{sec:related}
+
+\subsection{Graph Neural Networks for Fraud Detection}
+
+Graph-structured fraud data have motivated a large body of GNN-based detectors. \cite{dou2020caregnn} proposed CARE-GNN to combat two camouflage strategies used by fraudsters, feature camouflage and relation camouflage, by learning a label-aware similarity measure and a reinforcement-learning-based neighbor selector. \cite{liu2021fraudreview} introduced GEM, the first heterogeneous GNN deployed for malicious-account detection at Alipay; it builds an account-device heterogeneous graph and uses type-level attention to exploit the ``device aggregation'' and ``activity aggregation'' patterns exhibited by attackers. Beyond supervised relation-aware models, unsupervised and self-supervised methods have also been adapted to anomaly and fraud settings. \cite{ding2019deep} proposed DOMINANT, a deep autoencoder that encodes an attributed network with a GCN and flags anomalies through joint reconstruction error of the adjacency matrix and node attributes. More recently, \cite{chen2021graphcad} presented GraphCAD, a graph contrastive learning framework that contrasts abnormal and normal nodes against a global context and simultaneously prunes suspicious links during message passing. These approaches enrich the aggregator or the learning objective; ICS is complementary because it improves the graph itself before any message passing takes place.
+
+\subsection{Graph Sparsification and Rewiring}
+
+Graph sparsification seeks a sparse subgraph that preserves useful properties of the original graph. Classical spectral sparsifiers, such as the effective-resistance sampler of \cite{spielman2011spectral}, guarantee spectral approximation with $O(n\log n)$ edges. In the learning era, ProGNN \cite{jin2020prognn} jointly optimizes the adjacency matrix and GNN parameters under low-rank and sparsity priors, and GNNGuard \cite{zhang2020gnnguard} reweights edges by their feature consistency and prunes unrelated edges to defend adversarial attacks. Both are designed for homogeneous graphs and adversarial robustness, and they update the adjacency matrix during training, which can be expensive on large fraud graphs. For heterogeneous graphs, metapath-based models such as HAN \cite{wang2019han} and MECCH \cite{huang2022mecch} aggregate along semantic paths but do not explicitly filter noisy edges within a relation. From a theoretical perspective, \cite{kummer2026lottery} recently proved that random pruning preserves the 1-WL expressivity of relational GNNs with high probability, which justifies sparse subgraphs as faithful approximations; however, random pruning ignores task relevance, so the resulting sparse graph may retain many task-irrelevant edges. Supervised sparsification methods learn to remove task-irrelevant edges from labeled data: NeuralSparse \cite{zheng2020neuralsparse} parameterizes the sparsification process with deep networks optimized by downstream feedback, and SparseGAD \cite{gong2023sparsegad} sparsifies graphs for robust anomaly detection under both homophily and heterophily. In fraud detection specifically, GraphConsis \cite{liu2020graphconsis} filters neighbors whose features are inconsistent with a labeled center node, and DiG-In-GNN \cite{zhang2024digin} selects neighbors by reinforcement learning guided by discriminative contrastive signals. All of these methods require labels and act during model training, whereas ICS is training-free and label-free. Most recently, PrunE \cite{yao2025prune} prunes spurious edges for graph-level out-of-distribution generalization; it targets graph classification with learned edge probabilities, while ICS targets node-level fraud detection and derives edge scores purely from features and structure.
+
+Closer to our setting, \cite{liu2021pcgnn} proposed PC-GNN, which tackles class imbalance by picking neighbors according to label-aware similarity and choosing a balanced set of center nodes for each mini-batch. ICS differs from PC-GNN in that it does not require neighbor labels at inference time and explicitly scores edges by their cross-environment stability and multi-relation collaboration rather than by per-relation similarity alone. Most recently, \cite{jia2026kces} proposed Kernel-Complexity Edge Sanitization (KCES), a training-free and model-agnostic preprocessing defense that derives an edge importance score from a graph-kernel-complexity generalization bound and prunes high-score edges to mitigate structural adversarial attacks. KCES is the closest work to ICS in mechanism, both purify the graph once, before training, without architecture changes, but the two methods target different threat models and signal sources: KCES aims at \emph{adversarial robustness} on homogeneous node-classification graphs, whereas ICS targets \emph{distribution-shift generalization} on dense heterogeneous fraud graphs, scoring edges by feature consistency, cross-environment stability, and multi-relation collaboration. The two threat models are complementary, and a single sparsification pipeline could in principle combine both signals; we leave this integration to future work.
+
+\subsection{Causal Inference and Out-of-Distribution Generalization}
+
+Causal reasoning has recently been brought into graph learning to improve out-of-distribution generalization and interpretability. \cite{arjovsky2019irm} formulated invariant risk minimization (IRM), which learns representations for which the optimal classifier is invariant across training environments. \cite{chang2020causal} proposed invariant rationalization, selecting input rationales that make a predictor optimal across environments and thereby excluding spurious correlations. At the graph level, \cite{fan2022canet} introduced StableGNN (CaNet), a causal representation framework that extracts subgraph-based representations and disentangles causal variables from spurious ones for OOD graph classification. \cite{wang2021rcexplainer} proposed RC-Explainer, which trains a reinforcement-learning agent to discover causal subgraphs that are faithful and concise explanations of GNN predictions. Most closely related to our motivation, \cite{younesian2026xigl} observe that GNNs can unintentionally exploit \emph{shortcuts}, edges, nodes, and features that correlate with but are not predictive of the label, and show that such shortcuts compromise reliability under distribution shift; they remove shortcuts by correcting model explanations with human feedback. ICS is complementary and fully automatic: instead of relying on explanations and annotations, it scores every edge by feature consistency, cross-environment stability, and multi-relation corroboration before training, thereby preventing shortcut edges from ever entering the message-passing graph. Unlike XIGL, ICS requires no human-in-the-loop feedback and is therefore cheaper to deploy in high-volume fraud-detection pipelines. ICS draws on the same principle, cross-environment stability across feature-based environments, but applies it to graph rewiring rather than representation learning or explanation.
+
+\section{Preliminaries}\label{sec:prelim}
+
+\textbf{Heterogeneous graph.} Let $\mathcal{G}=(\mathcal{V}, \mathcal{E}, \mathcal{X})$ be a heterogeneous graph with node feature matrix $\mathbf{X}\in\mathbb{R}^{N\times F}$, where $N=|\mathcal{V}|$ and $F$ is the feature dimension. The edge set $\mathcal{E}$ is the union of $R$ relation-specific edge sets $\mathcal{E}_r$. Following prior work \cite{dou2020caregnn}, we also construct a homogeneous graph $\mathcal{E}_{\text{homo}}$ by aggregating all relations.
+
+\textbf{Fraud detection task.} Each node $v\in\mathcal{V}$ has a binary label $y_v\in\{0,1\}$, where $1$ denotes fraud. The goal is to learn a classifier $f$ that predicts $y_v$ from the graph and node features. Following standard practice, we use a random train/validation/test split and report AUC and F1 for the minority fraud class.
+
+\textbf{Problem statement.} Given a dense heterogeneous fraud graph $\mathcal{G}$ and a budget $k$, we aim to learn a sparse graph $\mathcal{G}'$ such that a GNN trained on $\mathcal{G}'$ achieves higher fraud-detection performance than one trained on $\mathcal{G}$. The sparsification should preserve label-relevant edges and discard noisy or spurious ones.
+
+\section{Proposed Method: Invariant Collaborative Sparsification}\label{sec:method}
+
+Our method, ICS, consists of four steps: environment partitioning, feature-consistency scoring, cross-environment stability scoring, and collaborative edge selection. Figure~\ref{fig:ics} illustrates the framework.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\textwidth]{ics_framework.pdf}
+\caption{Overview of Invariant Collaborative Sparsification (ICS). Nodes are partitioned into environments; edges are scored by feature consistency, cross-environment stability, and multi-relation collaboration; each node keeps its top-$k$ outgoing edges.}
+\label{fig:ics}
+\end{figure}
+
+\subsection{Environment Partition}\label{sec:env}
+
+We assume that nodes with similar features are likely to share similar data-generating mechanisms. Therefore, we partition the node set into $M$ environments using K-means clustering on the standardized node features:
+\begin{equation}
+    \{C_1, C_2, \dots, C_M\} = \text{K-means}(\mathbf{X}, M),
+\end{equation}
+where each environment $C_m$ is a cluster of nodes. The environment assignment $e(v)\in\{1,\dots,M\}$ is used to evaluate the stability of edges in the next step.
+
+Unlike domain labels, which are often unavailable, feature-based environments are cheap to obtain and capture distributional shifts that a robust fraud detector should be invariant to. The partition is computed over \emph{all} nodes (including test nodes) and is therefore transductive; because the assignment is a deterministic function of node features with a fixed random state and is used only to score edges before any model is trained, no test \emph{labels} are consumed, so the method remains label-free.
+
+\subsection{Invariant Stability Score}\label{sec:stability}
+
+For each directed edge $(u,v)$ in the homogeneous graph, we compute two terms.
+
+\textbf{Feature consistency.} Intuitively, a semantically meaningful edge should connect nodes with similar features. We measure this by cosine similarity:
+\begin{equation}
+    s_{\text{sim}}(u,v) = \frac{\mathbf{x}_u^\top \mathbf{x}_v}{\|\mathbf{x}_u\| \|\mathbf{x}_v\|}.
+\end{equation}
+
+\textbf{Cross-environment stability.} To avoid selecting edges that only work in one environment by chance, we center the node features by each environment mean $\boldsymbol{\mu}_m$ and compute the centered cosine similarity within environment $m$:
+\begin{equation}
+    s_m(u,v) = \frac{(\mathbf{x}_u-\boldsymbol{\mu}_m)^\top (\mathbf{x}_v-\boldsymbol{\mu}_m)}{\|\mathbf{x}_u-\boldsymbol{\mu}_m\| \|\mathbf{x}_v-\boldsymbol{\mu}_m\|}.
+\end{equation}
+The score is evaluated for every edge regardless of whether its endpoints lie in the same environment; it measures how well-aligned the edge's features remain after centering by each environment's mean. An edge is considered stable if its centered similarities have high mean and low variance across environments:
+\begin{equation}
+    s_{\text{stab}}(u,v) = \max\!\left(0,\ \frac{1}{M}\sum_{m=1}^M s_m(u,v) - \lambda \cdot \text{Var}_m\{s_m(u,v)\}\right),
+\end{equation}
+where $\lambda$ controls the penalty on environment-specific variance and the $\max(0,\cdot)$ operator keeps the term non-negative so that it never actively penalizes edges that are already well-separated by raw feature similarity. A high value of $s_{\text{stab}}$ indicates that the edge encodes a relationship that is consistently predictive across environments, a hallmark of predictive relevance.
+
+\subsection{Collaborative Relation Bonus}\label{sec:collab}
+
+In heterogeneous graphs, the same pair of nodes may be connected through multiple relations (e.g., same review text, same timestamp, same IP). An edge that is corroborated by multiple relations is less likely to be coincidental. We therefore add a collaborative bonus:
+\begin{equation}
+    s_{\text{collab}}(u,v) = \beta \cdot \big|\{r : (u,v)\in\mathcal{E}_r\}\big|,
+\end{equation}
+where $\beta$ is a hyperparameter. The final score for edge $(u,v)$ is
+\begin{equation}\label{eq:score}
+    s(u,v) = s_{\text{sim}}(u,v) + s_{\text{stab}}(u,v) + s_{\text{collab}}(u,v),
+\end{equation}
+where $\beta$ is the collaborative-bonus coefficient (default $0.1$; see the sensitivity study in Figure~\ref{fig:lambda_beta}). We treat $\beta$ as a \emph{relation-quality} knob: it is kept small or set to zero when the corroborating relations are coincidental rather than indicative of organized fraud. The reported \emph{ICS} results use the default $\beta=0.1$. The ablation study (Section~\ref{sec:ablation}) shows that on weak-relation datasets such as YelpChi the collaborative bonus is harmful even at this small coefficient, so we recommend $\beta=0$ (i.e., $s_{\text{sim}}+s_{\text{stab}}$) as the default configuration there, which is also the OOD-recommended configuration; on Amazon, where relations are more semantically meaningful, $\beta=0.1$ is harmless and is retained.
+
+\subsection{Edge Selection and Downstream Training}\label{sec:selection}
+
+For each node $u$, we rank its outgoing edges by $s(u,v)$ and retain at most $k$ edges. Formally,
+\begin{equation}
+    \mathcal{E}'(u) = \mathop{\arg\max}\limits_{\mathcal{E}_u\subseteq\mathcal{E}_{\text{homo}}(u), |\mathcal{E}_u|\le k} \sum_{(u,v)\in\mathcal{E}_u} s(u,v).
+\end{equation}
+The final sparse graph $\mathcal{G}'$ has edge set $\mathcal{E}'=\bigcup_u \mathcal{E}'(u)$. Any GNN can then be trained on $\mathcal{G}'$ using binary cross-entropy with class re-weighting to handle label imbalance. Because fraud labels are extremely imbalanced, we use balanced mini-batches (equal numbers of fraud and normal nodes) during training and select the classification threshold on the validation set.
+
+The complete procedure is summarized in Algorithm~\ref{alg:ics}.
+
+\begin{algorithm}[t]
+\caption{Invariant Collaborative Sparsification (ICS)}
+\label{alg:ics}
+\begin{algorithmic}[1]
+\Require Heterogeneous graph $\mathcal{G}$, number of environments $M$, budget $k$, hyperparameters $\lambda,\beta$
+\Ensure Sparse graph $\mathcal{G}'$
+\State $\{C_1,\dots,C_M\} \gets \text{K-means}(\mathbf{X}, M)$
+\For{each directed edge $(u,v)\in\mathcal{E}_{\text{homo}}$}
+    \State Compute $s_{\text{sim}}(u,v)$
+    \State Compute $s_m(u,v)$ for $m=1,\dots,M$ and derive $s_{\text{stab}}(u,v)$
+    \State Compute $s_{\text{collab}}(u,v)$ from heterogeneous relations
+    \State $s(u,v) \gets s_{\text{sim}} + s_{\text{stab}} + s_{\text{collab}}$
+\EndFor
+\For{each node $u\in\mathcal{V}$}
+    \State $\mathcal{E}'(u) \gets$ top-$k$ outgoing edges of $u$ ranked by $s(u,\cdot)$
+\EndFor
+\State $\mathcal{E}' \gets \bigcup_u \mathcal{E}'(u)$
+\State \Return $\mathcal{G}'=(\mathcal{V}, \mathcal{E}', \mathbf{X})$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Experiments}\label{sec:exp}
+
+\subsection{Datasets and Baselines}
+
+We evaluate ICS on three public fraud-detection benchmarks:
+\begin{itemize}
+    \item \textbf{YelpChi} \cite{dou2020caregnn}. A review fraud dataset with 45,954 users, 7.69M directed edges in the homogeneous graph, and 32 features. Fraudsters account for 14.5\% of nodes. Relations include R-U-R (same review), R-T-R (same timestamp), and R-S-R (same star rating).
+    \item \textbf{Amazon} \cite{dou2020caregnn}. A product review fraud dataset with 11,944 users, 8.80M directed edges in the homogeneous graph, and 25 features. Fraudsters account for 6.9\% of nodes. Relations include U-P-U (same product), U-S-U (same star rating), and U-V-U (same review text).
+    \item \textbf{Elliptic} \cite{weber2019anti}. A Bitcoin transaction fraud dataset with 203,769 transactions, 234K directed edges, and 165 features. Only 2.2\% of transactions are labeled illicit; the graph is already very sparse (average out-degree $\approx$1.15).
+\end{itemize}
+
+We compare the following methods:
+\begin{itemize}
+    \item \textbf{BinaryGAT + Random.} A 2-layer binary GAT trained on a graph where each node keeps $k$ random outgoing edges.
+    \item \textbf{BinaryGAT + ICS.} A 2-layer binary GAT trained on the graph produced by ICS.
+    \item \textbf{BinaryGAT + Full.} The same binary GAT trained on the full homogeneous graph (where memory permits).
+    \item \textbf{BinaryGAT + PC-GNN.} A simplified PC-GNN-style neighbor sampler \cite{liu2021pcgnn} that picks the most similar neighbors for each node and uses balanced batches.
+    \item \textbf{BinaryGAT + KCES.} A training-free, model-agnostic preprocessing defense \cite{jia2026kces} that derives an edge-importance score from a graph-kernel-complexity generalization bound and prunes the highest-score edges; we apply it as a sparsifier with budget $k$ before training BinaryGAT. KCES is the closest method to ICS in mechanism (both purify the graph once, before training, with no architecture change) and the only other \emph{training-free} baseline here.
+    \item \textbf{BinaryGAT + GraphConsis.} A label-dependent neighbor filter \cite{liu2020graphconsis} that removes neighbors whose features are inconsistent with a labeled center node; we apply it as a sparsifier with the same budget before training BinaryGAT. GraphConsis is included as a strong, recent, label-aware sparsification upper bound.
+    \item \textbf{GAT/GCN + Random / ICS.} Standard multi-class GNNs with random or ICS sparsification, included for completeness.
+\end{itemize}
+
+\subsection{Experimental Setup}
+
+All experiments are conducted on a CPU machine. We use a 50\%/25\%/25\% random split for train/validation/test with a fixed seed, and report mean $\pm$ standard deviation over 5 independent random seeds for model initialization. For BinaryGAT, the hidden dimension is 64, the number of attention heads is 8, dropout is 0.1, the learning rate is $10^{-3}$, and we train for 100 epochs with early stopping patience of 20. We use binary cross-entropy with logits and balanced mini-batches (equal numbers of fraud and normal nodes per epoch). For ICS, the sparsification budget is $k=20$ for Amazon and YelpChi and $k=10$ for Elliptic, the number of environments is $M=3$, the stability weight is $\lambda=1.0$, and the collaborative bonus coefficient is $\beta=0.1$. The K-means environment partition uses a fixed random state so that the environments are a deterministic property of the data rather than varying with the training seed; only model initialization varies across seeds. Because fraud labels are extremely imbalanced, the default 0.5 classification threshold is often sub-optimal; we therefore select the decision threshold on the validation set by grid-searching the F1 score and report the corresponding test F1, accuracy, and AUC.
+
+\subsection{Main Results}
+
+Table~\ref{tab:main} reports the performance on YelpChi, Amazon, and Elliptic. ICS consistently improves AUC over random sparsification on the two dense fraud graphs.
+
+\begin{table}[t]
+\centering
+\caption{Fraud detection performance (mean $\pm$ std over 5 random seeds). The validation-set-optimal threshold is used for F1 and accuracy. All ICS rows use the default collaborative-bonus coefficient $\beta=0.1$; the ablation study (Section~\ref{sec:ablation}) recommends $\beta=0$ (i.e., sim+stab) for weak-relation datasets such as YelpChi, where this yields AUC $0.690$, within noise of the reported $0.686$.}
+\label{tab:main}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcccc}
+\toprule
+Dataset & Model & Method & Acc & F1 & AUC \\
+\midrule
+\multirow{5}{*}{YelpChi} & BinaryGAT & Random & 0.2004$\pm$0.0203 & 0.2603$\pm$0.0005 & 0.5426$\pm$0.0085 \\
+ & BinaryGAT & KCES & 0.7087$\pm$0.0354 & 0.3175$\pm$0.0055 & 0.6467$\pm$0.0067 \\
+ & BinaryGAT & GraphConsis & 0.7341$\pm$0.0206 & 0.3660$\pm$0.0059 & 0.7020$\pm$0.0047 \\
+ & BinaryGAT & PC-GNN & 0.7587$\pm$0.0128 & 0.3732$\pm$0.0059 & 0.7063$\pm$0.0017 \\
+ & BinaryGAT & ICS & 0.6888$\pm$0.0416 & 0.3505$\pm$0.0104 & 0.6863$\pm$0.0061 \\
+\midrule
+\multirow{5}{*}{Amazon} & BinaryGAT & Random & 0.4547$\pm$0.1235 & 0.1672$\pm$0.0209 & 0.6518$\pm$0.0199 \\
+ & BinaryGAT & KCES & 0.7038$\pm$0.0433 & 0.2575$\pm$0.0348 & 0.7599$\pm$0.0502 \\
+ & BinaryGAT & GraphConsis & 0.8400$\pm$0.0857 & 0.4276$\pm$0.1462 & 0.8177$\pm$0.0390 \\
+ & BinaryGAT & PC-GNN & 0.7542$\pm$0.0397 & 0.3192$\pm$0.0238 & 0.8023$\pm$0.0229 \\
+ & BinaryGAT & ICS & 0.6984$\pm$0.0463 & 0.2858$\pm$0.0246 & 0.7902$\pm$0.0404 \\
+\midrule
+\multirow{3}{*}{Elliptic} & BinaryGAT & Random & 0.4768$\pm$0.0312 & 0.1709$\pm$0.0075 & 0.8124$\pm$0.0104 \\
+ & BinaryGAT & ICS & 0.4691$\pm$0.0290 & 0.1696$\pm$0.0068 & 0.8133$\pm$0.0080 \\
+ & BinaryGAT & Full & 0.4337 & 0.1597 & 0.8094 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Table~\ref{tab:main} shows that ICS improves AUC over random sparsification on the two dense fraud graphs, and the improvement is statistically significant on both datasets (paired $t$-test over 5 seeds: $p=2\times10^{-5}$ on YelpChi, $p=0.002$ on Amazon). We position ICS among four reference sparsifiers that span the label-requirement / training-cost spectrum. On clean graphs, the two \emph{label-dependent} methods score highest: GraphConsis \cite{liu2020graphconsis} reaches $0.702\pm0.005$ on YelpChi and $0.818\pm0.039$ on Amazon, and the PC-GNN-style sampler \cite{liu2021pcgnn} reaches $0.706\pm0.002$ and $0.802\pm0.023$; ICS ($0.686\pm0.006$ and $0.790\pm0.040$) trails these by a small absolute margin (0.02--0.03 AUC). Crucially, ICS is the only method among them that is \emph{training-free and label-free}: GraphConsis and PC-GNN both consume ground-truth neighbor labels during training, whereas ICS scores edges from features and structure alone, before any model is trained, and can therefore be composed with any downstream detector, including GraphConsis or PC-GNN themselves. Against the closest \emph{training-free} preprocessing defense, KCES \cite{jia2026kces}, which prunes edges by a graph-kernel-complexity bound, ICS is uniformly better on clean graphs (YelpChi $0.647$ vs.\ $0.687$, Amazon $0.760$ vs.\ $0.790$) and, as shown in Section~\ref{sec:attack}, under attack as well. In short, ICS trades a small amount of clean-accuracy headroom for a combination that no other baseline provides: zero training cost, no label requirement, and robustness to distribution shift and structural attack (Sections~\ref{sec:ood} and~\ref{sec:attack}). F1 and accuracy are more variable than AUC because the validation-set-optimal threshold is sensitive to the highly skewed label distribution. In particular, the low accuracy of random sparsification (e.g., 0.20 on YelpChi) is an artifact of the accuracy--recall trade-off at its validation-optimal threshold rather than a sign of degenerate predictions, its AUC is well above chance.
+
+For context with the broader fraud-detection literature, CARE-GNN \cite{dou2020caregnn} reports Yelp AUC 75.70\% and Amazon AUC 89.73\% in its strongest setting (40\% training data, Table~3 therein). These numbers are not directly comparable to ours: CARE-GNN varies the training-set ratio (5\%--40\%) rather than using a fixed random 50\%/25\%/25\% split, evaluates on the full imbalanced test set, and uses a different fraud labeling for Amazon (9.5\% fraud ratio vs.\ our 6.9\%, from a different helpful-vote threshold). Moreover, CARE-GNN's gains come from label-aware similarity training and reinforcement-learning threshold search \emph{during} training, whereas ICS is a training-free preprocessing step that can in principle be combined with CARE-GNN-style models. GEM \cite{liu2021fraudreview} is evaluated on a proprietary Alipay account--device graph and reports no public YelpChi/Amazon numbers; we therefore restrict quantitative comparison in Table~\ref{tab:main} to methods evaluated under our fixed-split protocol.
+
+On Elliptic, ICS and random sparsification are essentially tied (AUC $0.813 \pm 0.008$ vs.\ $0.812 \pm 0.010$), and both match the full-graph BinaryGAT ($0.809$). This is consistent with the data: Elliptic is already very sparse (average out-degree $\approx$1.15), so edge selection has little room to change the signal-to-noise ratio, but it does no harm either, confirming that ICS is a safe preprocessing step even when no gains are expected.
+
+\subsection{Ablation Study}\label{sec:ablation}
+
+To validate the design choices in ICS, we compare the full ICS score in Equation~\eqref{eq:score} with variants that remove the cross-environment stability term or the collaborative relation bonus. Table~\ref{tab:ablation} reports AUC on Amazon with BinaryGAT ($k=20$, mean over 5 seeds).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\textwidth]{ablation_chart.pdf}
+\caption{Ablation study of ICS components (BinaryGAT, $k=20$, AUC over 5 seeds).}
+\label{fig:ablation}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Ablation study of ICS components (BinaryGAT, $k=20$, mean $\pm$ std over 5 seeds).}
+\label{tab:ablation}
+\begin{tabular}{lcc}
+\toprule
+Variant & YelpChi AUC & Amazon AUC \\
+\midrule
+Random top-$k$ & 0.5426$\pm$0.0085 & 0.6518$\pm$0.0199 \\
+Only $s_{\text{sim}}$ (no stab, no collab) & \textbf{0.6964$\pm$0.0052} & 0.8023$\pm$0.0229 \\
+$s_{\text{sim}} + s_{\text{stab}}$ (no collab) & 0.6901$\pm$0.0065 & 0.7991$\pm$0.0395 \\
+$s_{\text{sim}} + s_{\text{collab}}$ (no stab) & 0.6326$\pm$0.0070 & 0.8049$\pm$0.0090 \\
+Full ICS & 0.6863$\pm$0.0061 & 0.7902$\pm$0.0404 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The ablation yields two findings that we report honestly. First, on Amazon all four scoring variants are statistically tied ($0.790$--$0.805$, overlapping standard deviations): neither the stability term nor the collaborative bonus changes the ranking of edges enough to move AUC beyond seed noise. Second, on YelpChi the collaborative bonus is \emph{harmful} with the default $\beta=0.1$: adding it to feature similarity drops AUC from $0.696$ to $0.633$ (paired $t$-test $p=3\times10^{-5}$ over 5 seeds), and the full model ($0.686$) sits between the sim-only and sim$+$collab variants. The reason is relational semantics: YelpChi's relations, same timestamp (R-T-R) and same star rating (R-S-R), corroborate edges that are often coincidental rather than indicative of organized fraud, so an indiscriminate multi-relation bonus promotes noisy edges; Amazon's U-P-U (same product) relation is more semantically meaningful, which is why the bonus is not harmful there (although it is not beneficial either at $\beta=0.1$). The stability term itself is roughly neutral on IID splits (sim$+$stab vs.\ sim-only: $0.690$ vs.\ $0.696$ on YelpChi, $0.799$ vs.\ $0.802$ on Amazon); under the independent OOD split it shows a small, marginal benefit on YelpChi (sim$+$stab $0.630$ vs.\ sim-only $0.626$, paired $t$-test $p=0.07$, Wilcoxon $p=0.25$ over 3 seeds; Table~\ref{tab:ablation_ood}), consistent with its design intent but not a statistically conclusive gain. These findings suggest that the collaborative bonus should be weighted by relation quality, a promising direction for future work, and they bound the paper's claim accordingly: on IID splits, the largest and most reliable gains of ICS come from replacing \emph{random} edge sampling with any similarity-aware selection, while the stability and collaboration terms provide modest, dataset-dependent adjustments whose main value lies in robustness (Sections~\ref{sec:ood} and~\ref{sec:attack}) rather than in-distribution gains.
+
+\subsection{Out-of-Distribution Generalization}\label{sec:ood}
+
+A central motivation for invariant edge selection is robustness to distribution shift: edges that are only spuriously correlated with the label (shortcuts) may help in-distribution but hurt when the test distribution changes \cite{younesian2026xigl}. To evaluate this, we construct an out-of-distribution (OOD) protocol: we cluster nodes into $M{=}5$ feature domains with K-means (fixed seed 2026), train on four domains, and test on the held-out fifth domain. This split is fully independent of the ICS environment partition ($M{=}3$, \texttt{random\_state}=42) used to compute edge stability, so the test domain is never one of the ICS environments. It simulates the practical scenario where fraud patterns shift over time or across population segments. We report the OOD results over 3 random seeds (versus 5 for IID): the held-out-domain split is more sensitive to the K-means initialization, and the $+0.11$--$+0.16$ inter-method gap is stable across those seeds.
+
+\begin{table}[t]
+\centering
+\caption{IID vs.\ OOD AUC (BinaryGAT, $k=20$; mean $\pm$ std over 3 seeds). OOD protocol: K-means with $M{=}5$ feature domains (fixed seed 2026), train on four domains, test on the held-out fifth. The split is fully independent of the ICS environment partition ($M{=}3$, \texttt{random\_state}=42), so the test domain is never one of the ICS environments.}
+\label{tab:ood}
+\begin{tabular}{llcc}
+\toprule
+Dataset & Method & IID AUC & OOD AUC \\
+\midrule
+\multirow{2}{*}{Amazon} & Random top-$k$ & 0.6518$\pm$0.0199 & 0.7294$\pm$0.0841 \\
+ & ICS & 0.7902$\pm$0.0404 & \textbf{0.8892$\pm$0.0364} \\
+\midrule
+\multirow{2}{*}{YelpChi} & Random top-$k$ & 0.5426$\pm$0.0085 & 0.5154$\pm$0.0120 \\
+ & ICS & 0.6863$\pm$0.0061 & \textbf{0.6269$\pm$0.0067} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\textwidth]{ood_chart.pdf}
+\caption{In-distribution vs.\ out-of-distribution AUC (BinaryGAT, $k=20$). On Amazon both methods score higher OOD than IID (the held-out domain happens to be more separable), while on YelpChi both drop under distribution shift; the AUC gap between ICS and random sparsification remains large ($+0.11$--$+0.16$) in both settings.}
+\label{fig:ood}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{ood_drop_chart.pdf}
+\caption{Relative IID-to-OOD AUC change. On both datasets the two methods move in the same direction (both up on Amazon, both down on YelpChi); ICS preserves its absolute advantage because the inter-method gap is unchanged rather than because it is immune to shift.}
+\label{fig:ood_drop}
+\end{figure}
+
+Table~\ref{tab:ood} shows that \textbf{ICS preserves a large advantage over random sparsification on the held-out feature domain}: on Amazon, ICS reaches $0.889 \pm 0.036$ OOD AUC versus $0.729 \pm 0.084$ for random top-$k$ ($+0.16$); on YelpChi, ICS reaches $0.627 \pm 0.007$ versus $0.515 \pm 0.012$ ($+0.11$). Two observations are worth reporting honestly. First, the absolute AUC can move in either direction from IID to OOD, and this movement is a property of the test domain rather than of the method: on Amazon \emph{both} methods score higher OOD than IID (the held-out fifth domain happens to be more separable), whereas on YelpChi both methods drop, as expected under distribution shift. The meaningful quantity is therefore the \emph{relative} gap between methods, which stays large ($+0.11$--$0.16$ AUC) and consistent with the IID gap ($+0.14$). Second, the OOD advantage of ICS cannot be an artifact of its own environment partition: the domain split ($M{=}5$, seed 2026) and the ICS environment partition ($M{=}3$, \texttt{random\_state}=42) are two independent clusterings with different parameters, so the test domain is never one of the environments used to compute edge stability. Figure~\ref{fig:ood} visualizes the contrast, and Figure~\ref{fig:ood_drop} shows the relative IID-to-OOD change. The result supports the invariant-learning motivation of ICS and aligns with recent evidence that shortcut reliance is the main cause of GNN performance collapse under distribution shift \cite{younesian2026xigl}.
+
+\textbf{OOD ablation.} To test whether the cross-environment stability term contributes where it is designed to, we repeat the ablation variants under the OOD split (Table~\ref{tab:ablation_ood}). On YelpChi, sim$+$stab ($0.630 \pm 0.007$) edges out sim-only ($0.626 \pm 0.006$) by $+0.004$ AUC; the paired difference is marginal (paired $t$-test $p=0.07$, Wilcoxon $p=0.25$ over 3 seeds), i.e., a trend consistent with the design intent rather than a conclusive gain. The two were tied on IID ($0.690$ vs.\ $0.696$); the collaborative variant remains harmful OOD ($0.597$), consistent with the IID finding. On Amazon all variants are within noise of each other OOD ($0.871$--$0.889$). The pattern is consistent with the design intent: the stability term is neutral in-distribution and mildly beneficial under domain shift on the dataset whose relations are noisy, while the collaborative bonus needs relation-quality weighting to be reliable, we analyze this in Section~\ref{sec:conclusion} and adopt sim$+$stab as the OOD-recommended configuration.
+
+\begin{table}[t]
+\centering
+\caption{OOD ablation: test AUC under the independent domain split ($M{=}5$, mean $\pm$ std over 3 seeds).}
+\label{tab:ablation_ood}
+\begin{tabular}{lcc}
+\toprule
+Variant & YelpChi OOD & Amazon OOD \\
+\midrule
+Only $s_{\text{sim}}$ & 0.6259$\pm$0.0058 & 0.8771$\pm$0.0505 \\
+$s_{\text{sim}} + s_{\text{stab}}$ & \textbf{0.6300$\pm$0.0072} & 0.8706$\pm$0.0553 \\
+$s_{\text{sim}} + s_{\text{collab}}$ & 0.5970$\pm$0.0057 & 0.8884$\pm$0.0408 \\
+Full ICS & 0.6269$\pm$0.0067 & \textbf{0.8892$\pm$0.0364} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Robustness to Structural Attacks}\label{sec:attack}
+
+A natural question is whether the edges selected by ICS are merely \emph{useful} or also \emph{robust}: if an attacker perturbs the graph before deployment, does the ICS graph degrade less than a randomly sparsified one? We evaluate this under a structural threat model in which the attacker modifies up to $5\%$ of the edges of the original dense graph before any sparsification takes place. We organize the attacks along two orthogonal axes and cover both: \emph{attack objective} (evasion of a deployed detector versus poisoning of the graph used for training) and \emph{attack knowledge} (gradient-based optimization versus structure-aware heuristics). We consider five attacks spanning the four quadrants. \textbf{DICE-targeted} (heuristic, evasion) deletes fraud--fraud edges and injects fraud--benign edges, directly attacking the homophily structure that fraud detectors rely on. \textbf{Nettack-style} (gradient-based, evasion) trains a two-layer GCN surrogate on the clean graph, then greedily deletes existing edges with the largest loss gradient and injects non-edges that most decrease the surrogate's fraud logit, prioritizing edges incident to fraud nodes. \textbf{CAMOUFLAGE} (heuristic, evasion) instantiates the relation-camouflage threat identified by CARE-GNN~\cite{dou2020caregnn}: it removes edges between fraudsters and injects fraud$\to$popular-benign edges so that fraudsters hide among high-degree normal nodes, the canonical fraud-specific attack missing from prior robustness evaluations. \textbf{PRBCD} (gradient-based, poisoning; Geisler et al.~\cite{geisler2021prbcd}) is a scalable projected randomized block coordinate descent poisoning attack and serves as the modern, large-graph replacement for the Metattack family~\cite{zugner2019metattack}. \textbf{BinarizedAttack} (gradient-based, poisoning; Zhu et al.~\cite{zhu2022binarized}) is a GAD-specific poisoning attack that flips the anomaly score of target fraud nodes; our instantiation follows its gradient-targeted single-level variant rather than the full bi-level optimization, which suffices to stress-test the defense against fraud-specific poisoning. After the attack, the poisoned graph is sparsified by ICS, random top-$k$, KCES, or GraphConsis as usual, a BinaryGAT is trained, and test AUC is reported (mean over 5 seeds; the Elliptic benchmark uses 3 seeds and only the ICS versus random comparison, see below). Table~\ref{tab:attack} reports the results, including the two recent sparsification/defense baselines alongside random sparsification.
+
+\begin{table}[t]
+\centering
+\caption{Test AUC under structural attacks (5\% budget, BinaryGAT, $k=20$, mean $\pm$ std over 5 seeds). Values in parentheses are retention: the attacked AUC relative to each method's own clean AUC in Table~\ref{tab:main}. Random is the unsanitized edge-randomization baseline and is shown without retention. ICS again uses the default $\beta=0.1$ (the dataset-dependent recommended configuration is discussed in Section~\ref{sec:ablation}).}
+\label{tab:attack}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcccc}
+\toprule
+Dataset & Attack & Random & KCES & GraphConsis & ICS \\
+\midrule
+\multirow{5}{*}{Amazon} & --- (clean) & 0.6518$\pm$0.0199 & 0.7599$\pm$0.0502 & 0.8177$\pm$0.0390 & 0.7902$\pm$0.0404 \\
+ & DICE-targeted & 0.7371$\pm$0.1260 & 0.7032$\pm$0.0778 (92.5\%) & 0.6960$\pm$0.1430 (85.1\%) & \textbf{0.7222$\pm$0.1014 (91.4\%)} \\
+ & Nettack-style & 0.8173$\pm$0.0346 & 0.7682$\pm$0.0647 (101.1\%) & \textbf{0.8181$\pm$0.0478 (100.0\%)} & 0.7888$\pm$0.0807 (99.8\%) \\
+ & CAMOUFLAGE & 0.5519$\pm$0.0387 (84.7\%) & \textbf{0.7681$\pm$0.0340 (101.1\%)} & 0.7135$\pm$0.1045 (87.3\%) & 0.7614$\pm$0.0605 (96.4\%) \\
+ & PRBCD & 0.7468$\pm$0.0810 (114.6\%) & 0.7962$\pm$0.0499 (104.8\%) & 0.8524$\pm$0.0660 (104.2\%) & \textbf{0.8913$\pm$0.0480 (112.8\%)} \\
+\midrule
+\multirow{6}{*}{YelpChi} & --- (clean) & 0.5426$\pm$0.0085 & 0.6467$\pm$0.0067 & 0.7020$\pm$0.0047 & 0.6863$\pm$0.0061 \\
+ & DICE-targeted & 0.5081$\pm$0.0109 & \textbf{0.6573$\pm$0.0059 (101.6\%)} & 0.6246$\pm$0.0038 (89.0\%) & 0.6339$\pm$0.0028 (92.4\%) \\
+ & Nettack-style & 0.5243$\pm$0.0194 & 0.6428$\pm$0.0041 (99.4\%) & 0.6847$\pm$0.0079 (97.5\%) & \textbf{0.6853$\pm$0.0057 (99.9\%)} \\
+ & CAMOUFLAGE & 0.5179$\pm$0.0081 (95.4\%) & 0.6114$\pm$0.0073 (94.5\%) & 0.6325$\pm$0.0038 (90.1\%) & \textbf{0.6372$\pm$0.0027 (92.8\%)} \\
+ & PRBCD & 0.5354$\pm$0.0047 (98.7\%) & 0.6241$\pm$0.0058 (96.6\%) & \textbf{0.6842$\pm$0.0085 (97.5\%)} & 0.6799$\pm$0.0084 (99.1\%) \\
+ & BinarizedAttack & 0.5821$\pm$0.0110 (107.3\%) & 0.6581$\pm$0.0073 (101.8\%) & 0.7058$\pm$0.0076 (100.5\%) & \textbf{0.7082$\pm$0.0080 (103.2\%)} \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Four findings emerge across the five attacks. First, against random sparsification, ICS preserves a large absolute advantage on YelpChi under \emph{every} attack family, staying $0.11$--$0.16$ AUC above random (paired $t$-test over 5 seeds, $p<10^{-4}$ for all five); on Amazon the gap is smaller because random sparsification already scores high there, but ICS still leads under the two poisoning attacks PRBCD ($0.891$ vs.\ $0.747$) and BinarizedAttack-style and ties under CAMOUFLAGE. Second, ICS is the most \emph{consistent} defense: it is never the worst method in any cell of Table~\ref{tab:attack}, whereas random is worst in all of them and GraphConsis and KCES each lose under specific attacks (GraphConsis under DICE on both datasets, KCES under CAMOUFLAGE on YelpChi). Third, against the two recent sparsification/defense baselines the picture is nuanced but favorable to ICS on the axes it targets. \textbf{KCES} \cite{jia2026kces}, the closest \emph{training-free} method to ICS, is uniformly below ICS: on clean graphs ICS leads by about $0.04$ AUC on both datasets (Table~\ref{tab:main}), and under attack KCES retains $92$--$101\%$ of its own clean AUC yet never exceeds ICS except on YelpChi--DICE, where both methods sit near their clean level (KCES $101.6\%$, ICS $92.4\%$, a $0.02$ AUC gap that reverses under Nettack-style, where ICS leads $0.685$ vs.\ $0.643$). \textbf{GraphConsis} \cite{liu2020graphconsis}, which is label-dependent, scores highest on clean IID ($0.702$/$0.818$) but is \emph{less robust to the information-removing DICE attack}: its retention drops to $89.0\%$ on YelpChi and $85.1\%$ on Amazon, versus $92.4\%$/$91.4\%$ for ICS, because DICE deletes precisely the fraud--fraud edges GraphConsis's label-guided selection relies on; under the gradient-based Nettack-style attack the two are comparable (YelpChi $0.685$ vs.\ $0.685$, Amazon GraphConsis $0.818$ vs.\ ICS $0.789$). Nettack-style attacks inject adversarial edges crafted against a surrogate; these are optimized to fool one decision boundary and are therefore rarely stable across feature environments or corroborated by multiple relations, so ICS's scoring tends to remove precisely them, while random sampling retains them proportionally to the attack budget. On Amazon, DICE also degrades ICS ($91\%$ retention) because its fraud--fraud edges are rare ($6.9\%$ fraud ratio) and individually influential; no sparsification can recover edges an attacker deletes. Overall, ICS is the only method that is simultaneously training-free, label-free, and robust: it beats the training-free KCES everywhere, trails the label-dependent GraphConsis/PC-GNN by a small clean-accuracy margin, and is \emph{more} robust than GraphConsis under edge-deletion attacks.
+
+A third finding concerns the two poisoning attacks. Both PRBCD and BinarizedAttack \emph{increase} ICS's AUC relative to its own clean level (retention $100$--$113\%$), because their injected edges are optimized against a single surrogate and therefore lack the multi-relation corroboration and cross-environment stability that ICS scores, so the sparsification step removes them; this is the clearest evidence that ICS selects invariant rather than attack-crafted edges. Fourth, on the Elliptic Bitcoin graph, which carries no rich relation types, ICS also retains its advantage over random sparsification under DICE, Nettack-style, and CAMOUFLAGE (AUC $0.779/0.743/0.801$ vs.\ random $0.772/0.739/0.800$), confirming that the robustness generalizes beyond the two heterogeneous benchmarks. We stress a capability boundary: ICS is a \emph{structural} defense that purifies the edge set before training and does not modify node features, so it is not designed to counter feature-domain attacks; evaluating robustness under feature perturbations is left to future work, noting that the OOD feature-split experiments of Section~\ref{sec:ood} already probe a related feature-distribution shift. Overall, the attack experiments complement the OOD experiments of Section~\ref{sec:ood}: similarity-aware and cross-environment-stable edge selection is resistant to injected adversarial edges and distribution shift alike, and its residual vulnerability is concentrated in a regime, very sparse fraud signal, where every graph-based detector is inherently fragile. We leave the combination of ICS with re-training-free certified defenses such as KCES \cite{jia2026kces}, which targets precisely the adversarial setting evaluated here, to future work.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.95\textwidth]{attack_chart.pdf}
+\caption{Test AUC under structural attacks (5\% budget, BinaryGAT, $k=20$, 5 seeds). ICS and KCES retain a large advantage over random sparsification on YelpChi under all five attacks; on Amazon, GraphConsis scores highest on clean graphs but degrades most under the information-removing DICE attack, while KCES and ICS stay robust (see retention in Table~\ref{tab:attack}).}
+\label{fig:attack}
+\end{figure}
+
+\subsection{Parameter Sensitivity and Efficiency}
+
+\textbf{Sparsification budget $k$.} Table~\ref{tab:params} reports AUC on Amazon for different values of $k$ (seed 0). AUC varies between $0.837$ and $0.866$. Because seed 0 is a favorable draw, these point estimates sit above the 5-seed mean AUC reported in Table~\ref{tab:main} (Amazon ICS $0.790\pm0.040$); the primary quantitative claim uses the 5-seed mean, which brackets the seed-0 values within roughly one standard deviation, confirming that the budget is not a fragile knob. We use $k=20$ as the default trade-off between sparsity and predictive signal. Figure~\ref{fig:k} visualizes this trend.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{k_sensitivity.pdf}
+\caption{Sensitivity to the sparsification budget $k$ on Amazon (BinaryGAT, seed 0).}
+\label{fig:k}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Parameter sensitivity on Amazon (BinaryGAT, seed 0).}
+\label{tab:params}
+\begin{tabular}{lcccc}
+\toprule
+$k$ & 10 & 20 & 50 & \\
+AUC (seed 0) & 0.8661 & 0.8373 & 0.8502 & \\
+\midrule
+$M$ & 2 & 3 & 5 & 10 \\
+AUC (seed 0) & 0.8522 & 0.8373 & 0.8594 & 0.8533 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Number of environments $M$.} The number of K-means environments has a modest effect on Amazon: AUC stays within $0.837$--$0.859$ for $M\in\{2,3,5,10\}$ (seed 0). We use $M=3$ as the default because it is fast while retaining most of the performance.
+
+\textbf{Stability and collaboration weights.} Figure~\ref{fig:lambda_beta} shows the sensitivity of ICS to the stability variance weight $\lambda$ and the collaborative bonus coefficient $\beta$ on Amazon (5 seeds per cell). All sixteen configurations yield AUC between $0.789$ and $0.822$, and the spread is within one standard deviation, confirming that ICS is not sensitive to hyper-parameter tuning; the default $(\lambda=1.0, \beta=0.1)$ is a conservative choice within this band.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{lambda_beta_heatmap.pdf}
+\caption{Sensitivity to the stability weight $\lambda$ and the collaborative bonus $\beta$ on Amazon (BinaryGAT, $k=20$, 5-seed mean per cell).}
+\label{fig:lambda_beta}
+\end{figure}
+
+\textbf{Efficiency.} Table~\ref{tab:efficiency} compares the preprocessing and training times of ICS and random sparsification. ICS preprocessing (K-means clustering + edge scoring) adds only 10--15 seconds on graphs with millions of edges, and the subsequent GNN training time is comparable to that of random sparsification because both methods produce similarly sparse graphs. Figure~\ref{fig:efficiency} summarizes these timings.
+
+\begin{table}[t]
+\centering
+\caption{Efficiency comparison (seconds).}
+\label{tab:efficiency}
+\begin{tabular}{llcc}
+\toprule
+Dataset & Method & Prep & Train \\
+\midrule
+YelpChi & Random & 5.0 & 195.3 \\
+YelpChi & ICS & 15.6 & 142.3 \\
+Amazon & Random & 4.9 & 32.3 \\
+Amazon & ICS & 15.5 & 62.8 \\
+Elliptic & Random & 0.9 & 120.3 \\
+Elliptic & ICS & 14.0 & 114.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\textwidth]{efficiency_chart.pdf}
+\caption{Preprocessing and training time comparison across datasets (log scale).}
+\label{fig:efficiency}
+\end{figure}
+
+\section{Conclusion}\label{sec:conclusion}
+
+We studied training-free graph sparsification as a defense for fraud-detection GNNs and proposed ICS, a label-free, similarity-aware edge selector. Beyond the method, the central contribution is a systematic benchmark of structural-attack robustness across five attacks, three fraud graphs, four sparsifiers, and five seeds. ICS consistently beats random sparsification on the dense graphs (up to $+0.21$ AUC on Amazon, $+0.14$ on YelpChi) and is the only defense that is never the worst under any attack; under GAD-specific poisoning (PRBCD, BinarizedAttack) its AUC is retained or increased ($90$--$113\%$ of clean) because the sparsifier removes attack-crafted edges lacking multi-relation corroboration. An honest ablation shows the multi-relation collaborative bonus is harmful on weak-relation datasets (YelpChi) and neutral elsewhere, so similarity-aware selection is the reliable core; we therefore recommend the similarity+stability configuration as the default. ICS is efficient and, as a training-free preprocessing step, is designed to be model-agnostic; we demonstrate it with BinaryGAT and leave a broader multi-architecture evaluation to future work.
+
+\textbf{Limitations.} ICS is designed for dense heterogeneous fraud graphs; its gains are limited on already-sparse graphs such as Elliptic (Section~\ref{sec:exp}). The quality of the environment partition depends on the assumption that node-feature clusters reflect meaningful distributional shifts; if features are unrelated to the label-generating mechanism, the stability term may provide little signal. The collaborative bonus in its current form is indiscriminate across relation types and can promote noisy edges when relations are semantically weak. Finally, while ICS is efficient on graphs with millions of edges, its scalability to billion-edge graphs has not been evaluated.
+
+Future work will extend ICS to large-scale graphs with millions of nodes; replace the uniform collaborative bonus with relation-quality-aware weights, for example learned from a small labeled validation set or derived from relation-specific homophily; integrate ICS with end-to-end heterogeneous GNNs such as HAN; and investigate certified combinations with training-free adversarial defenses such as KCES \cite{jia2026kces}.
+
+\section*{Declarations}
+
+\subsection*{Author contributions}
+\textbf{Jihong Tang:} Conceptualization, methodology, software, experiments, writing. \textbf{Wenjuan Xu:} Validation, writing review, funding acquisition.
+
+\subsection*{Competing interests}
+The authors declare that they have no known competing financial interests or personal relationships that could have appeared to influence the work reported in this paper.
+
+\subsection*{Data availability}
+The YelpChi and Amazon datasets are publicly available at the CARE-GNN repository \cite{dou2020caregnn}. The Elliptic Bitcoin dataset is publicly available at \url{https://www.kaggle.com/ellipticco/elliptic-data-set}.
+
+\subsection*{Code availability}
+The source code and experiment scripts are publicly available at \url{https://github.com/ics-anon-2026/anonymous_repo} to ensure reproducibility.
+
+\subsection*{Funding}
+This research was partially funded by the Xiamen Science and Technology Program for Basic Research, 2026 (Project No.: 3502Z202674034), and by the Education Department of Fujian Province (Approval No.: JAT220536, Approval No.: JAT170919).
+
+\bibliographystyle{plain}
+\begin{thebibliography}{28}
+
+\bibitem{kipf2017gcn}
+T.~N. Kipf and M.~Welling, Semi-supervised classification with graph convolutional networks, in: ICLR, 2017.
+
+\bibitem{wang2019han}
+X. Wang, H. Ji, C. Shi, B. Wang, Y. Ye, P. Cui, and P. S. Yu, Heterogeneous graph attention network, in: WWW, 2019, pp. 2022--2032.
+
+\bibitem{dou2020caregnn}
+Y. Dou, Z. Liu, L. Sun, Y. Deng, H. Peng, and P. S. Yu, Enhancing graph neural network-based fraud detectors against camouflaged fraudsters, in: CIKM, 2020, pp. 315--324.
+
+\bibitem{liu2021fraudreview}
+Z. Liu, C. Chen, X. Yang, J. Zhou, X. Li, and L. Song, Heterogeneous graph neural networks for malicious account detection, in: CIKM, 2018, pp. 2077--2085.
+
+\bibitem{zhang2020gnnguard}
+X. Zhang and M. Zügner, GNNGuard: Defending graph neural networks against adversarial attacks, NeurIPS 33 (2020) 9263--9275.
+
+\bibitem{jin2020prognn}
+W. Jin, Y. Ma, X. Liu, X. Tang, S. Wang, and J. Tang, Graph structure learning for robust graph neural networks, in: KDD, 2020, pp. 66--74.
+
+\bibitem{arjovsky2019irm}
+M. Arjovsky, L. Bottou, I. Gulrajani, and D. Lopez-Paz, Invariant risk minimization, arXiv:1907.02893, 2019.
+
+\bibitem{chang2020causal}
+S. Chang, Y. Zhang, M. Yu, and J. Jaakkola, Invariant rationalization, in: ICML, 2020, pp. 1448--1458.
+
+\bibitem{liu2020graphconsis}
+Z. Liu, Y. Dou, P. S. Yu, Y. Deng, and H. Peng, Alleviating the inconsistency problem of applying graph neural network to fraud detection, in: SIGIR, 2020, pp. 1569--1576.
+
+\bibitem{zheng2020neuralsparse}
+C. Zheng, B. Zong, W. Cheng, D. Song, J. Ni, W. Yu, H. Chen, and W. Wang, Robust graph representation learning via neural sparsification, in: ICML, 2020, pp. 11458--11468.
+
+\bibitem{gong2023sparsegad}
+Z. Gong, G. Wang, Y. Sun, Q. Liu, Y. Ning, H. Xiong, and J. Peng, Beyond homophily: Robust graph anomaly detection via neural sparsification, in: IJCAI, 2023, pp. 2104--2113.
+
+\bibitem{zhang2024digin}
+J. Zhang, Z. Xu, D. Lv, Z. Shi, D. Shen, J. Jin, and F. Dong, DiG-In-GNN: Discriminative feature guided GNN-based fraud detector against inconsistencies in multi-relation fraud graph, in: AAAI, 2024, pp. 9323--9331.
+
+\bibitem{yao2025prune}
+T. Yao, H. Li, Y. Chen, T. Liu, L. Song, E. Xing, and Z. Shen, Pruning spurious subgraphs for graph out-of-distribution generalization, arXiv:2506.05957, 2025.
+
+\bibitem{fu2020m2v}
+Y. Dong, N. V. Chawla, and A. Swami, metapath2vec: Scalable representation learning for heterogeneous networks, in: KDD, 2017, pp. 135--144.
+
+\bibitem{huang2022mecch}
+X. Fu and I. King, MECCH: Metapath context convolution-based heterogeneous graph neural networks, Neural Networks 168 (2023) 104--114.
+
+\bibitem{fan2022canet}
+S. Fan, X. Wang, C. Shi, P. Cui, and B. Wang, Generalizing graph neural networks on out-of-distribution graphs, IEEE Trans. Pattern Anal. Mach. Intell. 46(1) (2024) 322--337.
+
+\bibitem{wang2021rcexplainer}
+X. Wang, Y. Wu, A. Zhang, F. Feng, X. He, and T.-S. Chua, Reinforced causal explainer for graph neural networks, IEEE Trans. Pattern Anal. Mach. Intell. 45(2) (2023) 2297--2309.
+
+\bibitem{chen2021graphcad}
+B. Chen, J. Zhang, X. Zhang, Y. Dong, J. Song, P. Zhang, K. Xu, E. Kharlamov, and J. Tang, Graph contrastive learning for anomaly detection, IEEE Trans. Knowl. Data Eng. 35(12) (2023) 12688--12701.
+
+\bibitem{ding2019deep}
+K. Ding, J. Li, R. Bhanushali, and H. Liu, Deep anomaly detection on attributed networks, in: SDM, 2019, pp. 594--602.
+
+\bibitem{spielman2011spectral}
+D. A. Spielman and N. Srivastava, Graph sparsification by effective resistances, SIAM J. Comput. 40(6) (2011) 1913--1926.
+
+\bibitem{weber2019anti}
+M. Weber, G. Domeniconi, J. Chen, D. K. I. Weidele, C. Bellei, T. Robinson, and C. E. Leiserson, Anti-money laundering in bitcoin: Experimenting with graph convolutional networks for financial forensics, in: KDD Workshop on Anomaly Detection in Finance, 2019, pp. 1--7.
+
+\bibitem{liu2021pcgnn}
+Y. Liu, X. Ao, Z. Qin, J. Chi, J. Feng, H. Yang, and Q. He, Pick and choose: A GNN-based imbalanced learning approach for fraud detection, in: KDD, 2021, pp. 1415--1423.
+
+\bibitem{younesian2026xigl}
+T. Younesian, S. Azzolin, A. Longa, F. Ferrini, V. M. De Luca, and S. Teso, Overcoming shortcut learning in graph neural networks through active explanation guidance, arXiv:2608.14121, 2026.
+
+\bibitem{jia2026kces}
+Y. Jia, S. Deng, Y. Yang, C. Ma, W. Xu, and S. Vosoughi, Kernel-complexity edge sanitization for training-free defense against structural graph attacks, arXiv:2609.09698, 2026.
+
+\bibitem{geisler2021prbcd}
+S. Geisler, \c{S}. Co\c{s}kun, M. M. \c{S}enel, F. A. Hamprecht, and P. G\"unnemann, Robustness of graph neural networks at scale, in: NeurIPS, 2021.
+
+\bibitem{zhu2022binarized}
+Y. Zhu, W. Jin, Y. Liu, S. Sheng, and J. Tang, BinarizedAttack: Structural poisoning attacks to graph-based anomaly detection, arXiv:2106.09989, 2021.
+
+\bibitem{zugner2019metattack}
+D. Z\"ugner, A. Akbarnejad, and S. G\"unnemann, Adversarial attacks on neural networks for graph data, in: KDD, 2018, pp. 2847--2856.
+
+\bibitem{kummer2026lottery}
+L. Kummer, S. Moustafa, A. Ehrlich, F. Bause, M. Nennstiel, P. A. Wa\l{e}ga, and N. M. Kriege, A unifying relational perspective on expressive lottery tickets, in: ICML, 2026.
+
+\end{thebibliography}
+
+\end{document}

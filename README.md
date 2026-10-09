@@ -1,113 +1,86 @@
-# Invariant Collaborative Sparsification (ICS) — Reproducibility Guide
+# ICS — Training-Free Graph Sparsification as a Robust Defense against Structural Attacks on Fraud-Detection Graphs
 
-Anonymous code repository for the paper *Invariant Collaborative Sparsification for Robust Fraud Detection on Heterogeneous Graphs*.
+Code and evaluation protocol for the systematic benchmark described in the manuscript
+submitted to *Discover Artificial Intelligence* (Springer). It accompanies the paper
+"Training-Free Graph Sparsification as a Robust Defense against Structural Attacks on
+Fraud Detection Graphs: A Systematic Benchmark".
 
-## Environment
+## Method
 
-- Python 3.8+ with PyTorch >= 1.12, PyTorch Geometric >= 2.0, scikit-learn, scipy, pandas
-- CPU is sufficient for all experiments in the paper (no GPU required)
-- Tested on: Windows 10, Python 3.13 (Miniconda), PyTorch 2.x, PyG 2.x
+**ICS (Invariant Collaborative Sparsification)** is a training-free, label-free edge-selection
+method for fraud-detection graphs. Every edge is scored by (i) feature consistency,
+(ii) cross-environment stability, and (iii) an optional multi-relation collaborative bonus;
+the top-`k` edges are kept *before* any downstream model is trained. Because it consumes only
+features and structure, it can be composed with any graph model (here: BinaryGAT).
 
-```bash
-pip install torch torch_geometric scikit-learn scipy pandas
-```
+## Repository layout
 
-## Data
+- `src/direction2/` — ICS implementation, baselines (random top-`k`, KCES, GraphConsis,
+  a PC-GNN-style sampler), datasets (YelpChi, Amazon, Elliptic), training/eval, and the
+  attack benchmark entry points:
+  - `experiments/run_attack.py` — run one (dataset, attack, defense, seed) combination.
+  - `experiments/phase2_launcher.py` — run the full 198-combination matrix; spawns one
+    isolated subprocess per combination, honors a wall-clock budget (`--max-hours`), and
+    resumes from already-produced CSVs.
+  - `experiments/aggregate_attack_results.py` — aggregate all produced CSVs into the
+    summary table (AUC mean ± std over seeds).
+- `src/common/attacks/` — unified attack dispatcher `connect.py` and the implementations of
+  CAMOUFLAGE, PRBCD, Metattack, and a BinarizedAttack-style structural perturbation, plus
+  `resource_limiter.py` (CPU/memory guard). `connect.py` imports `deeprobust_wrapper` from
+  this same folder.
+- `paper/paper_discover.tex` — LaTeX source of the submitted manuscript.
+- `RESULTS.md` — the aggregated 198-run attack benchmark (AUC mean ± std across seeds).
 
-Download the datasets and place them under `data/`:
+## Dependencies
 
-1. **YelpChi & Amazon**: from the [CARE-GNN repository](https://github.com/YingtongDou/CARE-GNN) (`data/YelpChi.mat`, `data/Amazon.mat`), or the [PC-GNN repository](https://github.com/P FraudDetection/PC-GNN). Place under `data/raw/Fraud/`.
-2. **Elliptic Bitcoin**: from [Kaggle](https://www.kaggle.com/ellipticco/elliptic-data-set). Place `elliptic_bitcoin_dataset/` under `data/elliptic/`.
+- Python 3.12+
+- `torch`, `torch_geometric`
+- `deeprobust` (provides PRBCD / Metattack / DICE / Nettack)
+- `scikit-learn`, `numpy`, `scipy`, `matplotlib`
 
-The raw `.mat` files are converted to PyTorch-Geometric `Data` objects on first run and cached under `data/processed/`.
+The scripts add `src/direction2/{data,models,utils}` and `src/common/attacks` to `sys.path`
+automatically, so no manual `PYTHONPATH` setup is required.
 
-## Repository Layout
+## Datasets
 
-```
-src/direction2/
-  models/            # BinaryGAT, GCN, GAT, HAN, PC-GNN sampler, CausalCollaborativeSparsification
-  data/              # FraudDataset, EllipticDataset, ood_split
-  utils/             # train_eval (BCE + balanced batches + gradient clipping), graph_utils
-  experiments/
-    run_ccs.py       # MAIN ENTRY: all IID main-table, ablation, sensitivity runs
-    run_attack.py    # structural attack experiments (DICE / Nettack-style)
-    run_significance.py  # paired t-test / Wilcoxon over the 5-seed results
-papers/direction2/   # paper source (paper.tex), figures, generate_docx.py
-results/direction2/  # all experiment CSVs (one file per run)
-```
+- **YelpChi** and **Amazon**: public from the CARE-GNN repository.
+- **Elliptic**: public from <https://www.kaggle.com/ellipticco/elliptic-data-set>.
 
-## Reproducing the Main Results (Table 1)
+Place the raw data under `src/direction2/data/` (see `download_datasets.py`).
 
-All runs use a fixed random 50%/25%/25% split and report mean ± std over 5 seeds (0–4).
+## Reproduce
 
-```bash
-PY=python   # your python
-RUN=src/direction2/experiments/run_ccs.py
-COMMON="--model BinaryGAT --balanced_batch --use_val_threshold --epochs 100 --lr 0.001 --dropout 0.1"
-
-# YelpChi / Amazon: Random, ICS, PC-GNN  (seeds 0-4)
-for DS in YelpChi Amazon; do
-  for SEED in 0 1 2 3 4; do
-    python $RUN --dataset $DS --method random  --topk 20 --seed $SEED $COMMON
-    python $RUN --dataset $DS --method ccs    --topk 20 --n_envs 3 --seed $SEED $COMMON
-    python $RUN --dataset $DS --method pcgnn  --topk 20 --pcgnn_pos_ratio 0.5 --seed $SEED $COMMON
-  done
-done
-
-# Elliptic: Random / ICS (topk=10, seeds 0-2) and full graph (topk=100)
-for SEED in 0 1 2; do
-  python $RUN --dataset Elliptic --method random --topk 10 --seed $SEED $COMMON
-  python $RUN --dataset Elliptic --method ccs    --topk 10 --n_envs 3 --seed $SEED $COMMON
-done
-python $RUN --dataset Elliptic --method full --topk 100 --seed 0 $COMMON
-```
-
-## Reproducing the Ablation (Table 2)
+Single combination:
 
 ```bash
-for DS in YelpChi Amazon; do
-  for SEED in 0 1 2 3 4; do
-    python $RUN --dataset $DS --method ccs --topk 20 --n_envs 3 --seed $SEED --no_stab --no_collab $COMMON   # sim only
-    python $RUN --dataset $DS --method ccs --topk 20 --n_envs 3 --seed $SEED --no_stab $COMMON                # sim+stab
-    python $RUN --dataset $DS --method ccs --topk 20 --n_envs 3 --seed $SEED --no_collab $COMMON              # sim+collab
-  done
-done
+cd src/direction2/experiments
+python run_attack.py --dataset YelpChi --attack camo --defense ics --seed 0
 ```
 
-## Reproducing OOD Generalization (Table 3)
+Full 198-run matrix (hard-coded across Amazon / YelpChi / Elliptic, 5 structural attacks,
+4 sparsifiers, 5 seeds; resumes from existing outputs):
 
 ```bash
-for DS in YelpChi Amazon; do
-  for SEED in 0 1 2; do
-    python $RUN --dataset $DS --method ccs    --topk 20 --n_envs 3 --seed $SEED --ood_split $COMMON
-    python $RUN --dataset $DS --method random --topk 20 --seed $SEED --ood_split $COMMON
-  done
-done
+cd src/direction2/experiments
+python phase2_launcher.py --max-hours 8
 ```
 
-## Reproducing Structural Attack Robustness (Table 4)
+Aggregate the produced CSVs:
 
 ```bash
-python src/direction2/experiments/run_attack.py --all --budget 0.05   # 40 runs: 2 datasets x 2 attacks x 2 defenses x 5 seeds... (seeds 0-2 via --all; add 3-4 with run_attack_seeds34.py)
-```
-
-## Reproducing Parameter Sensitivity (Figure 9–10)
-
-```bash
-python src/direction2/experiments/run_lambda_beta_grid.py      # seed 0
-python src/direction2/experiments/run_lambda_beta_seeds.py     # seeds 1-4
-python src/direction2/experiments/combine_lambda_beta.py       # merge + heatmap
-# k / M sensitivity: vary --topk {10,20,50} and --n_envs {2,3,5,10} with seed 0
-```
-
-## Significance Tests
-
-```bash
-python src/direction2/experiments/run_significance.py
+cd src/direction2/experiments
+python aggregate_attack_results.py
 ```
 
 ## Notes
 
-- The sparsification preprocessing (`CausalCollaborativeSparsification`) is deterministic given the data: K-means uses `random_state=42`, so environments are a fixed property of each dataset; only model initialization varies across seeds.
-- All reported numbers in the paper are mean ± std (population std, `np.std`) over the seeds listed above.
-- A full re-run of every experiment in the paper takes approximately 3–4 hours on a modern CPU.
+- Sparsification is deterministic given the data: K-means uses a fixed random state, so
+  environments are a fixed property of each dataset; only model initialization varies across seeds.
+- All reported numbers are mean ± std (population std) over the seeds above.
+- A full CPU re-run of the 198-combination matrix is segmented into wall-clock-bounded
+  batches via `--max-hours`; each combination runs in an isolated subprocess so memory is
+  reclaimed cleanly between runs.
+
+## License
+
+Released for the reproducibility of the submitted work.

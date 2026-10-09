@@ -11,7 +11,7 @@ import csv
 
 ROOT = Path(__file__).resolve().parents[3]
 RUN_CCS = Path(__file__).resolve().parent / "run_ccs.py"
-PYTHON = Path(sys.executable)
+PYTHON = Path(r"D:\Miniconda3\python.exe")
 
 lambdas = [0.0, 0.5, 1.0, 2.0]
 betas = [0.0, 0.05, 0.1, 0.2]

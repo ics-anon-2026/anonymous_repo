@@ -1,0 +1,47 @@
+[
+  {
+    "N": 1000,
+    "denseA_GB": 0.004,
+    "sec_per_iter": 0.0019
+  },
+  {
+    "N": 2000,
+    "denseA_GB": 0.016,
+    "sec_per_iter": 0.0117
+  },
+  {
+    "N": 4000,
+    "denseA_GB": 0.064,
+    "sec_per_iter": 0.0171
+  },
+  {
+    "N": 8000,
+    "denseA_GB": 0.256,
+    "sec_per_iter": 0.0712
+  },
+  {
+    "N": 16000,
+    "denseA_GB": 1.024,
+    "sec_per_iter": 0.3118
+  },
+  {
+    "extrap": "YelpChi",
+    "N": 45954,
+    "denseA_GB": 8.4,
+    "sec_per_iter_est": 1.6668,
+    "n_pert_5pct": 384697,
+    "hours_5pct_x3": 53434.0,
+    "n_pert_2pctN": 919,
+    "hours_2pctN_x3": 127.6
+  },
+  {
+    "extrap": "Amazon",
+    "N": 11944,
+    "denseA_GB": 0.6,
+    "sec_per_iter_est": 0.1615,
+    "n_pert_5pct": 439839,
+    "hours_5pct_x3": 5920.0,
+    "n_pert_2pctN": 238,
+    "hours_2pctN_x3": 3.2
+  }
+]

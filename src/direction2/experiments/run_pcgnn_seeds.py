@@ -7,7 +7,7 @@ import csv
 
 ROOT = Path(__file__).resolve().parents[3]
 RUN_CCS = Path(__file__).resolve().parent / "run_ccs.py"
-PYTHON = Path(sys.executable)
+PYTHON = Path(r"D:\Miniconda3\python.exe")
 
 out_file = ROOT / "results" / "direction2" / "pcgnn_amazon_seeds0_4.csv"
 with open(out_file, "w", newline="") as fh:
